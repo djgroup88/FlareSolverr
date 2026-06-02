@@ -477,7 +477,8 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             logging.info("Waiting " + str(req.waitInSeconds) + " seconds before returning the response...")
             time.sleep(req.waitInSeconds)
 
-        challenge_res.response = driver.page_source
+        if not utils.try_set_solution_image_response(driver, challenge_res, req.url):
+            challenge_res.response = driver.page_source
 
     if req.returnScreenshot:
         challenge_res.screenshot = driver.get_screenshot_as_base64()

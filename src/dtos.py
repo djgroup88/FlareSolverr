@@ -7,6 +7,7 @@ class ChallengeResolutionResultT:
     url: str = None
     status: int = None
     headers: list = None
+    # HTML for normal pages; raw base64 string (no data: prefix) when the URL is an image
     response: str = None
     cookies: list = None
     userAgent: str = None

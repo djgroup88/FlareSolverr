@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import urllib.parse
 
+import requests
 from selenium.webdriver.chrome.webdriver import WebDriver
 import undetected_chromedriver as uc
 
@@ -312,25 +314,58 @@ def extract_version_nt_folder() -> str:
     return ''
 
 
+def _default_user_agent() -> str:
+    major = get_chrome_major_version() or '120'
+    if PLATFORM_VERSION == 'nt' or (PLATFORM_VERSION is None and os.name == 'nt'):
+        platform_token = 'Windows NT 10.0; Win64; x64'
+    else:
+        platform_token = 'X11; Linux x86_64'
+    return (
+        f'Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 (KHTML, like Gecko) '
+        f'Chrome/{major}.0.0.0 Safari/537.36'
+    )
+
+
+def _safe_quit_driver(driver: WebDriver) -> None:
+    try:
+        if PLATFORM_VERSION == 'nt':
+            try:
+                driver.close()
+            except Exception:
+                pass
+        driver.quit()
+    except Exception:
+        pass
+
+
 def get_user_agent(driver=None) -> str:
     global USER_AGENT
     if USER_AGENT is not None:
         return USER_AGENT
 
+    owned_driver = driver is None
     try:
         if driver is None:
             driver = get_webdriver()
-        USER_AGENT = driver.execute_script("return navigator.userAgent")
-        # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
-        USER_AGENT = re.sub('HEADLESS', '', USER_AGENT, flags=re.IGNORECASE)
+        try:
+            driver.get('about:blank')
+        except Exception:
+            pass
+        ua = driver.execute_script('return navigator.userAgent')
+        if not ua:
+            USER_AGENT = _default_user_agent()
+            logging.warning('navigator.userAgent was empty; using fallback User-Agent')
+        else:
+            # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
+            USER_AGENT = re.sub('HEADLESS', '', ua, flags=re.IGNORECASE)
         return USER_AGENT
     except Exception as e:
-        raise Exception("Error getting browser User-Agent. " + str(e))
+        USER_AGENT = _default_user_agent()
+        logging.warning('Error getting browser User-Agent (%s); using fallback', e)
+        return USER_AGENT
     finally:
-        if driver is not None:
-            if PLATFORM_VERSION == "nt":
-                driver.close()
-            driver.quit()
+        if owned_driver and driver is not None:
+            _safe_quit_driver(driver)
 
 
 def start_xvfb_display():
@@ -339,6 +374,157 @@ def start_xvfb_display():
         from xvfbwrapper import Xvfb
         XVFB_DISPLAY = Xvfb()
         XVFB_DISPLAY.start()
+
+
+IMAGE_URL_EXTENSIONS = (
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.ico',
+    '.avif', '.jfif', '.tiff', '.tif',
+)
+
+
+def is_image_url(url: str) -> bool:
+    if not url:
+        return False
+    path = urllib.parse.urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in IMAGE_URL_EXTENSIONS)
+
+
+def is_image_content_type(content_type: str) -> bool:
+    if not content_type:
+        return False
+    return content_type.lower().split(';')[0].strip().startswith('image/')
+
+
+def _guess_image_mime(url: str, content_type: str | None = None) -> str:
+    if content_type and is_image_content_type(content_type):
+        return content_type.split(';')[0].strip()
+    ext = urllib.parse.urlparse(url).path.lower()
+    mime_by_ext = {
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.jfif': 'image/jpeg',
+        '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
+        '.bmp': 'image/bmp', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+        '.avif': 'image/avif', '.tiff': 'image/tiff', '.tif': 'image/tiff',
+    }
+    for suffix, guessed in mime_by_ext.items():
+        if ext.endswith(suffix):
+            return guessed
+    return 'application/octet-stream'
+
+
+def get_image_download_urls(driver: WebDriver, req_url: str | None) -> list[str]:
+    """Collect direct image URLs to download (request URL, current URL, <img src>)."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: str | None) -> None:
+        if not url or not url.startswith('http') or url in seen:
+            return
+        seen.add(url)
+        candidates.append(url)
+
+    if req_url:
+        add(req_url)
+    try:
+        add(driver.current_url)
+    except Exception:
+        pass
+    try:
+        from selenium.webdriver.common.by import By
+        for img in driver.find_elements(By.CSS_SELECTOR, 'img[src]'):
+            add(img.get_attribute('src'))
+    except Exception:
+        pass
+    return candidates
+
+
+def fetch_image_as_base64(driver: WebDriver, url: str) -> tuple[str | None, str | None]:
+    """
+    Download image bytes using the browser session cookies.
+    Returns (base64_string, mime_type) or (None, None) if not an image or on failure.
+    """
+    if not is_image_url(url):
+        return None, None
+
+    session = requests.Session()
+    for cookie in driver.get_cookies():
+        session.cookies.set(
+            cookie['name'],
+            cookie['value'],
+            domain=cookie.get('domain'),
+        )
+    referer = driver.current_url if driver else url
+    headers = {
+        'User-Agent': get_user_agent(driver),
+        'Referer': referer,
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    }
+    try:
+        resp = session.get(url, headers=headers, timeout=60)
+        resp.raise_for_status()
+        content_type = resp.headers.get('Content-Type', '')
+        if not is_image_content_type(content_type) and not is_image_url(url):
+            return None, None
+        mime = _guess_image_mime(url, content_type)
+        payload = base64.b64encode(resp.content).decode('ascii')
+        return payload, mime
+    except Exception as e:
+        logging.warning('Failed to fetch image as base64 from %s: %s', url, e)
+        return None, None
+
+
+def fetch_image_as_base64_via_browser(driver: WebDriver, url: str) -> tuple[str | None, str | None]:
+    """Fetch image inside the browser context (same cookies / CORS as the page)."""
+    if not is_image_url(url):
+        return None, None
+    try:
+        result = driver.execute_async_script("""
+            var imageUrl = arguments[0];
+            var done = arguments[arguments.length - 1];
+            fetch(imageUrl, { credentials: 'include', mode: 'cors' })
+                .then(function(response) {
+                    if (!response.ok) {
+                        done({ ok: false, error: 'HTTP ' + response.status });
+                        return;
+                    }
+                    return response.blob().then(function(blob) {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            var dataUrl = reader.result || '';
+                            var comma = dataUrl.indexOf(',');
+                            done({
+                                ok: true,
+                                b64: comma >= 0 ? dataUrl.substring(comma + 1) : dataUrl,
+                                type: blob.type || ''
+                            });
+                        };
+                        reader.onerror = function() { done({ ok: false, error: 'read failed' }); };
+                        reader.readAsDataURL(blob);
+                    });
+                })
+                .catch(function(err) { done({ ok: false, error: String(err) }); });
+        """, url)
+        if not result or not result.get('ok') or not result.get('b64'):
+            logging.warning('Browser fetch for image failed: %s', result)
+            return None, None
+        mime = _guess_image_mime(url, result.get('type'))
+        return result['b64'], mime
+    except Exception as e:
+        logging.warning('Browser fetch image error for %s: %s', url, e)
+        return None, None
+
+
+def try_set_solution_image_response(driver: WebDriver, challenge_res, req_url: str | None) -> bool:
+    """Set challenge_res.response to base64 when any candidate image URL works."""
+    for url in get_image_download_urls(driver, req_url):
+        if not is_image_url(url):
+            continue
+        for fetcher in (fetch_image_as_base64, fetch_image_as_base64_via_browser):
+            image_b64, image_mime = fetcher(driver, url)
+            if image_b64:
+                challenge_res.response = image_b64
+                logging.info('Image URL stored as base64 in response from %s (%s)', url, image_mime)
+                return True
+    return False
 
 
 def object_to_dict(_object):
