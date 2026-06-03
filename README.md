@@ -56,12 +56,20 @@ If you prefer the `docker cli` execute the following command:
 **Bash**
 
 ```bash
+# clone repo kamu
+git clone https://github.com/djgroup88/FlareSolverr.git
+cd FlareSolverr
+
+# build image dari Dockerfile, kasih nama bebas (misal flaresolverr-custom)
+docker build -t flaresolverr-custom .
+
+# jalanin pakai image hasil build tadi
 docker run -d \
   --name=flaresolverr \
   -p 8191:8191 \
   -e LOG_LEVEL=info \
   --restart unless-stopped \
-  ghcr.io/flaresolverr/flaresolverr:latest
+  flaresolverr-custom
 ```
 
 **Command Prompt or Powershell**
