@@ -514,7 +514,9 @@ def fetch_image_as_base64_via_browser(driver: WebDriver, url: str) -> tuple[str 
 
 
 def try_set_solution_image_response(driver: WebDriver, challenge_res, req_url: str | None) -> bool:
-    """Set challenge_res.response to base64 when any candidate image URL works."""
+    """Set challenge_res.response to base64 when the request URL is an image."""
+    if not req_url or not is_image_url(req_url):
+        return False
     for url in get_image_download_urls(driver, req_url):
         if not is_image_url(url):
             continue
